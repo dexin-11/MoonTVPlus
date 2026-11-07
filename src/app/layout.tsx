@@ -142,8 +142,7 @@ export default async function RootLayout({
   let advancedRecommendationEnabled = false;
   let localSettingsSyncMode: 'off' | 'manual' | 'auto' = 'off';
   // 特殊源名单：供客户端按入口隔离收藏与播放记录。
-  // 入口开关是本机 cookie，与存储模式无关，所以 localstorage 模式也要注入；
-  // getConfig() 有模块级缓存，generateMetadata 里已经调过一次，这里不产生额外读取。
+  // 入口开关是本机 cookie，与存储模式无关，所以 localstorage 模式也要注入。
   const specialSourceApis = (await getConfig()).SpecialSourceApis || [];
   let userFeatureAccess =
     storageType === 'localstorage'

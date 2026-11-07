@@ -78,6 +78,8 @@ export const API_CONFIG = {
 // 在模块加载时根据环境决定配置来源
 let cachedConfig: AdminConfig;
 let configInitPromise: Promise<AdminConfig> | null = null;
+// 用户自动迁移只需在每个 isolate 首次读取配置时尝试一次
+let configMigrationsDone = false;
 
 // 从配置文件文本里读 special_source_apis（兼容驼峰写法）
 function readSpecialSourceApisFromFile(configFile?: string): string[] {
@@ -444,29 +446,37 @@ async function getInitConfig(
 }
 
 export async function getConfig(): Promise<AdminConfig> {
-  // 直接使用内存缓存
-  if (cachedConfig) {
-    return cachedConfig;
-  }
+  const storageType = process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage';
 
-  // 如果正在初始化，等待初始化完成
-  if (configInitPromise) {
-    return configInitPromise;
-  }
-
-  // 创建初始化 Promise
-  configInitPromise = (async () => {
-    const storageType = process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage';
-
-    // localStorage 模式下直接从环境变量初始化
-    if (storageType === 'localstorage') {
+  // localStorage 模式没有外部存储，进程内缓存即可
+  if (storageType === 'localstorage') {
+    if (cachedConfig) {
+      return cachedConfig;
+    }
+    if (configInitPromise) {
+      return configInitPromise;
+    }
+    configInitPromise = (async () => {
       console.log('localStorage 模式：从环境变量初始化配置');
       const adminConfig = await getInitConfig('');
       cachedConfig = configSelfCheck(adminConfig);
       configInitPromise = null;
       return cachedConfig;
-    }
+    })();
+    return configInitPromise;
+  }
 
+  // 如果正在初始化，等待初始化完成（合并同一 isolate 内的并发请求）
+  if (configInitPromise) {
+    return configInitPromise;
+  }
+
+  // 注意：D1 / Redis / Postgres 等多实例存储不能使用长期的内存缓存。
+  // Cloudflare Workers 会并行运行多个 isolate，每个 isolate 各有一份模块级缓存；
+  // 在某个 isolate 保存配置后，其它 isolate 会一直返回旧配置，
+  // 表现为「保存成功，但刷新后回到原来的设置」，甚至把旧配置整体写回数据库。
+  // 因此这里每次调用都从存储重新读取，只对同一时刻的并发请求做合并。
+  configInitPromise = (async () => {
     // 读 db
     let adminConfig: AdminConfig | null = null;
     let dbReadFailed = false;
@@ -480,6 +490,12 @@ export async function getConfig(): Promise<AdminConfig> {
     // db 中无配置，执行一次初始化
     if (!adminConfig) {
       if (dbReadFailed) {
+        // 读取失败时沿用本 isolate 上次成功读取的配置，避免整站回退到默认值
+        if (cachedConfig) {
+          console.warn('数据库读取失败，沿用上次成功读取的配置');
+          configInitPromise = null;
+          return cachedConfig;
+        }
         // 数据库读取失败，使用默认配置但不保存，避免覆盖数据库
         console.warn('数据库读取失败，使用临时默认配置（不会保存到数据库）');
         adminConfig = await getInitConfig('');
@@ -512,25 +528,29 @@ export async function getConfig(): Promise<AdminConfig> {
 
     // 自动迁移用户（如果配置中有用户且V2存储支持）
     // 过滤掉站长后检查是否有需要迁移的用户
-    const nonOwnerUsers = adminConfig.UserConfig.Users.filter(
-      (u) => u.username !== process.env.USERNAME
-    );
-    if (!dbReadFailed && nonOwnerUsers.length > 0) {
-      try {
-        // 检查是否支持V2存储
-        const storage = (db as any).storage;
-        if (storage && typeof storage.createUserV2 === 'function') {
-          console.log('检测到配置中有用户，开始自动迁移...');
-          await db.migrateUsersFromConfig(adminConfig);
-          // 迁移完成后，清空配置中的用户列表并保存
-          adminConfig.UserConfig.Users = [];
-          await db.saveAdminConfig(adminConfig);
-          cachedConfig = adminConfig;
-          console.log('用户自动迁移完成');
+    // 只在当前 isolate 首次读取时尝试，避免每次请求都重复迁移
+    if (!dbReadFailed && !configMigrationsDone) {
+      configMigrationsDone = true;
+      const nonOwnerUsers = adminConfig.UserConfig.Users.filter(
+        (u) => u.username !== process.env.USERNAME
+      );
+      if (nonOwnerUsers.length > 0) {
+        try {
+          // 检查是否支持V2存储
+          const storage = (db as any).storage;
+          if (storage && typeof storage.createUserV2 === 'function') {
+            console.log('检测到配置中有用户，开始自动迁移...');
+            await db.migrateUsersFromConfig(adminConfig);
+            // 迁移完成后，清空配置中的用户列表并保存
+            adminConfig.UserConfig.Users = [];
+            await db.saveAdminConfig(adminConfig);
+            cachedConfig = adminConfig;
+            console.log('用户自动迁移完成');
+          }
+        } catch (error) {
+          console.error('自动迁移用户失败:', error);
+          // 不影响主流程，继续执行
         }
-      } catch (error) {
-        console.error('自动迁移用户失败:', error);
-        // 不影响主流程，继续执行
       }
     }
 
